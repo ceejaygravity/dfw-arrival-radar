@@ -2,6 +2,11 @@
 
 This is a small local website that tracks today's DFW arrivals, groups them by terminal and gate, and highlights flights expected to land ahead of schedule.
 
+## Live demo
+
+- Demo URL: [https://dfw-arrival-radar.onrender.com/](https://dfw-arrival-radar.onrender.com/)
+- Note: this demo runs on Render's free tier, so the first load can take up to about a minute if the service has been idle.
+
 ## Run it
 
 Use the bundled Python runtime:
