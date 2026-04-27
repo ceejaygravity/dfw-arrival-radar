@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: dfw-arrival-radar
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
+    plan: starter
+    healthCheckPath: /healthz

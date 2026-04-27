@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DFW Arrival Radar</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="background-glow background-glow-left"></div>
+    <div class="background-glow background-glow-right"></div>
+    <main class="page-shell">
+      <section class="hero reveal">
+        <div class="hero-copy">
+          <p class="eyebrow">Live DFW arrival operations</p>
+          <h1>See which gates are getting flights in ahead of schedule across every terminal.</h1>
+          <p class="lede">
+            The board tracks today's DFW arrivals, groups them by terminal and gate, and
+            pulls early landings to the top so you can spot gate pressure fast.
+          </p>
+        </div>
+        <div class="summary-grid" id="summaryGrid">
+          <article class="summary-card">
+            <span class="summary-label">Flights today</span>
+            <strong class="summary-value">...</strong>
+          </article>
+          <article class="summary-card">
+            <span class="summary-label">Early arrivals</span>
+            <strong class="summary-value">...</strong>
+          </article>
+          <article class="summary-card">
+            <span class="summary-label">Tracked gates</span>
+            <strong class="summary-value">...</strong>
+          </article>
+          <article class="summary-card">
+            <span class="summary-label">Most arrival flights</span>
+            <strong class="summary-value">...</strong>
+          </article>
+        </div>
+      </section>
+
+      <section class="control-bar reveal">
+        <label class="search-field" for="searchInput">
+          <span>Search gate, flight, airline, or origin</span>
+          <input id="searchInput" type="search" placeholder="Example: C20, AA2519, Boston">
+        </label>
+        <div class="terminal-filter" aria-labelledby="terminalFilterLabel">
+          <span id="terminalFilterLabel">Terminals to show</span>
+          <div class="terminal-filter-options" id="terminalFilterOptions"></div>
+        </div>
+        <label class="toggle-field" for="earlyOnlyToggle">
+          <input id="earlyOnlyToggle" type="checkbox">
+          <span>Only show early arrivals</span>
+        </label>
+        <button class="refresh-button" id="refreshButton" type="button">Refresh live data</button>
+      </section>
+
+      <section class="meta-bar reveal">
+        <div>
+          <span class="meta-label">Date</span>
+          <strong id="dateLabel">Loading...</strong>
+        </div>
+        <div>
+          <span class="meta-label">Last fetch</span>
+          <strong id="fetchedAtLabel">Loading...</strong>
+        </div>
+        <div>
+          <span class="meta-label">Source</span>
+          <strong id="sourceLabel">airport-dallas.com</strong>
+        </div>
+      </section>
+
+      <section class="status-banner reveal" id="statusBanner" hidden></section>
+      <section class="terminal-stack" id="terminalStack"></section>
+    </main>
+
+    <template id="flightRowTemplate">
+      <article class="flight-row-card">
+        <div class="flight-row-main">
+          <div>
+            <p class="flight-id"></p>
+            <p class="flight-route"></p>
+          </div>
+          <div class="flight-badges">
+            <span class="badge badge-status"></span>
+            <span class="badge badge-early" hidden></span>
+          </div>
+        </div>
+        <div class="flight-row-meta">
+          <span class="meta-pill meta-airline"></span>
+          <span class="meta-pill meta-schedule"></span>
+          <span class="meta-pill meta-estimate"></span>
+        </div>
+      </article>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+  </html>
