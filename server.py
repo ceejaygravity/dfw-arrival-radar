@@ -341,6 +341,12 @@ def enrich_flight(flight: dict) -> dict:
         flight["scheduledArrival"] = flight["scheduledTime"]
         flight["estimatedArrival"] = flight["eventTime"]
     else:
+        # Keep legacy fields populated so an older cached frontend bundle can
+        # still render without crashing while the new assets propagate.
+        flight["origin"] = flight["city"]
+        flight["originCode"] = flight["cityCode"]
+        flight["scheduledArrival"] = flight["scheduledTime"]
+        flight["estimatedArrival"] = flight["eventTime"]
         flight["destination"] = flight["city"]
         flight["destinationCode"] = flight["cityCode"]
         flight["scheduledDeparture"] = flight["scheduledTime"]
@@ -479,6 +485,7 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
             gate = terminal["gates"][gate_name]
             gate["arrivals"] = sort_flights(gate["arrivals"])
             gate["departures"] = sort_flights(gate["departures"])
+            gate["flights"] = sort_flights(gate["arrivals"] + gate["departures"])
             gate["turnWindows"] = build_turn_windows(gate["arrivals"], gate["departures"])
             if gate["turnWindows"]:
                 minutes = [window["minutesBetween"] for window in gate["turnWindows"]]
