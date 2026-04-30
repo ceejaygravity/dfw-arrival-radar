@@ -38,6 +38,16 @@ function formatTimestamp(value) {
 }
 
 
+function formatMinutes(minutes) {
+  if (minutes == null) return "N/A";
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  if (!hours) return `${remainder}m`;
+  if (!remainder) return `${hours}h`;
+  return `${hours}h ${remainder}m`;
+}
+
+
 function statusClass(status) {
   const value = (status || "").toLowerCase();
   if (value.includes("delayed")) return "is-delayed";
@@ -53,11 +63,12 @@ function matchesQuery(flight, query) {
     flight.flightNumber,
     ...(flight.codeshares || []),
     flight.airline,
-    flight.origin,
-    flight.originCode,
+    flight.city,
+    flight.cityCode,
     flight.gate,
     flight.terminal,
     flight.status,
+    flight.direction,
   ]
     .filter(Boolean)
     .join(" ")
@@ -77,6 +88,62 @@ function terminalIsSelected(terminalName) {
 }
 
 
+function computeTurnWindows(arrivals, departures) {
+  const windows = [];
+  let departureIndex = 0;
+
+  for (const arrival of arrivals) {
+    const arrivalIso = arrival.turnReferenceTimeIso;
+    if (!arrivalIso) continue;
+
+    while (departureIndex < departures.length) {
+      const departure = departures[departureIndex];
+      const departureIso = departure.turnReferenceTimeIso;
+      if (!departureIso) {
+        departureIndex += 1;
+        continue;
+      }
+      if (departureIso <= arrivalIso) {
+        departureIndex += 1;
+        continue;
+      }
+
+      const minutesBetween = Math.round(
+        (new Date(departureIso).getTime() - new Date(arrivalIso).getTime()) / 60000,
+      );
+      let category = "standard";
+      if (minutesBetween <= 60) {
+        category = "quick";
+      } else if (minutesBetween >= 180) {
+        category = "long";
+      }
+
+      windows.push({
+        arrivalFlightNumber: arrival.flightNumber,
+        departureFlightNumber: departure.flightNumber,
+        arrivalTime: arrival.turnReferenceTime,
+        departureTime: departure.turnReferenceTime,
+        minutesBetween,
+        category,
+      });
+      departureIndex += 1;
+      break;
+    }
+  }
+
+  return windows;
+}
+
+
+function sortGateFlights(flights) {
+  return [...flights].sort((a, b) => {
+    const left = a.scheduledTimeIso || "9999";
+    const right = b.scheduledTimeIso || "9999";
+    return left.localeCompare(right, undefined, { numeric: true });
+  });
+}
+
+
 function filterTerminals(terminals) {
   const query = state.query.trim().toLowerCase();
 
@@ -85,22 +152,37 @@ function filterTerminals(terminals) {
     .map((terminal) => {
       const gates = terminal.gates
         .map((gate) => {
-          const flights = gate.flights.filter((flight) => {
-            if (state.earlyOnly && !flight.isEarly) return false;
-            return matchesQuery(flight, query);
-          });
+          const arrivals = sortGateFlights(
+            gate.arrivals.filter((flight) => {
+              if (state.earlyOnly && !flight.isEarly) return false;
+              return matchesQuery(flight, query);
+            }),
+          );
+          const departures = sortGateFlights(
+            gate.departures.filter((flight) => matchesQuery(flight, query)),
+          );
+          const turnWindows = computeTurnWindows(arrivals, departures);
+          const turnMinutes = turnWindows.map((window) => window.minutesBetween);
 
           return {
             ...gate,
-            flights,
-            totalFlights: flights.length,
-            earlyFlights: flights.filter((flight) => flight.isEarly).length,
+            arrivals,
+            departures,
+            turnWindows,
+            arrivalCount: arrivals.length,
+            departureCount: departures.length,
+            totalFlights: arrivals.length + departures.length,
+            earlyFlights: arrivals.filter((flight) => flight.isEarly).length,
+            quickestTurnMinutes: turnMinutes.length ? Math.min(...turnMinutes) : null,
+            longestTurnMinutes: turnMinutes.length ? Math.max(...turnMinutes) : null,
           };
         })
-        .filter((gate) => gate.flights.length > 0)
+        .filter((gate) => gate.totalFlights > 0)
         .sort((a, b) => {
-          if (b.earlyFlights !== a.earlyFlights) {
-            return b.earlyFlights - a.earlyFlights;
+          const left = a.quickestTurnMinutes ?? Number.POSITIVE_INFINITY;
+          const right = b.quickestTurnMinutes ?? Number.POSITIVE_INFINITY;
+          if (left !== right) {
+            return left - right;
           }
           return a.gate.localeCompare(b.gate, undefined, { numeric: true });
         });
@@ -109,6 +191,8 @@ function filterTerminals(terminals) {
         ...terminal,
         gates,
         totalFlights: gates.reduce((sum, gate) => sum + gate.totalFlights, 0),
+        arrivalCount: gates.reduce((sum, gate) => sum + gate.arrivalCount, 0),
+        departureCount: gates.reduce((sum, gate) => sum + gate.departureCount, 0),
         earlyFlights: gates.reduce((sum, gate) => sum + gate.earlyFlights, 0),
         gateCount: gates.length,
       };
@@ -118,37 +202,32 @@ function filterTerminals(terminals) {
 
 
 function summarizeFiltered(terminals) {
-  const totalFlights = terminals.reduce((sum, terminal) => sum + terminal.totalFlights, 0);
+  const totalArrivals = terminals.reduce((sum, terminal) => sum + terminal.arrivalCount, 0);
+  const totalDepartures = terminals.reduce((sum, terminal) => sum + terminal.departureCount, 0);
   const earlyFlights = terminals.reduce((sum, terminal) => sum + terminal.earlyFlights, 0);
   const trackedGates = terminals.reduce((sum, terminal) => sum + terminal.gateCount, 0);
-  const busiestTerminal = terminals.reduce((current, terminal) => {
-    if (!current || terminal.totalFlights > current.totalFlights) {
-      return terminal;
-    }
-    return current;
-  }, null);
+  const turnWindows = terminals.flatMap((terminal) =>
+    terminal.gates.flatMap((gate) => gate.turnWindows),
+  );
 
   return {
-    totalFlights,
+    totalArrivals,
+    totalDepartures,
     earlyFlights,
     trackedGates,
-    busiestTerminal: busiestTerminal?.terminal || null,
-    busiestTerminalFlights: busiestTerminal?.totalFlights || 0,
+    quickTurnWindows: turnWindows.filter((window) => window.category === "quick").length,
+    longTurnWindows: turnWindows.filter((window) => window.category === "long").length,
   };
 }
 
 
 function renderSummary(summary) {
   const cards = [
-    ["Flights today", String(summary.totalFlights ?? 0)],
+    ["Arrivals today", String(summary.totalArrivals ?? 0)],
     ["Early arrivals", String(summary.earlyFlights ?? 0)],
-    ["Tracked gates", String(summary.trackedGates ?? 0)],
-    [
-      "Most arrival flights",
-      summary.busiestTerminal
-        ? `${summary.busiestTerminal} (${summary.busiestTerminalFlights})`
-        : "N/A",
-    ],
+    ["Departures today", String(summary.totalDepartures ?? 0)],
+    ["Quick turns", String(summary.quickTurnWindows ?? 0)],
+    ["Long gate gaps", String(summary.longTurnWindows ?? 0)],
   ];
 
   summaryGrid.innerHTML = "";
@@ -216,11 +295,20 @@ function renderTerminalFilter() {
 }
 
 
+function buildFlightRoute(flight) {
+  if (flight.direction === "departure") {
+    return `To ${flight.city} (${flight.cityCode}) from Gate ${flight.gateLabel}`;
+  }
+  return `${flight.city} (${flight.cityCode}) to Gate ${flight.gateLabel}`;
+}
+
+
 function buildFlightRow(flight) {
   const fragment = flightRowTemplate.content.cloneNode(true);
   const root = fragment.querySelector(".flight-row-card");
   const flightId = fragment.querySelector(".flight-id");
   const flightRoute = fragment.querySelector(".flight-route");
+  const badgeDirection = fragment.querySelector(".badge-direction");
   const badgeStatus = fragment.querySelector(".badge-status");
   const badgeEarly = fragment.querySelector(".badge-early");
   const airline = fragment.querySelector(".meta-airline");
@@ -229,7 +317,9 @@ function buildFlightRow(flight) {
 
   const codeshareText = flight.codeshares?.length ? ` | ${flight.codeshares.join(", ")}` : "";
   flightId.textContent = `${flight.flightNumber}${codeshareText}`;
-  flightRoute.textContent = `${flight.origin} (${flight.originCode}) to Gate ${flight.gateLabel}`;
+  flightRoute.textContent = buildFlightRoute(flight);
+  badgeDirection.textContent = flight.directionLabel || flight.direction;
+  badgeDirection.classList.add(flight.direction === "departure" ? "is-departure" : "is-arrival");
   badgeStatus.textContent = flight.status || "Status pending";
   const statusToken = statusClass(flight.status);
   if (statusToken) {
@@ -244,14 +334,71 @@ function buildFlightRow(flight) {
   }
 
   airline.textContent = flight.airline || "Airline pending";
-  schedule.textContent = `Scheduled ${flight.scheduledArrival || "TBD"}`;
-  estimate.textContent = `Estimate ${flight.estimatedArrival || "TBD"}`;
+  schedule.textContent = `${flight.direction === "departure" ? "Departs" : "Scheduled"} ${flight.scheduledTime || "TBD"}`;
+  estimate.textContent = flight.eventTime
+    ? `${flight.direction === "departure" ? "Latest" : "Estimate"} ${flight.eventTime}`
+    : `${flight.direction === "departure" ? "Latest" : "Estimate"} TBD`;
 
+  root.classList.add(flight.direction === "departure" ? "is-departure" : "is-arrival");
   if (flight.isEarly) {
     root.classList.add("is-early");
   }
 
   return fragment;
+}
+
+
+function buildFlightSection(title, flights, emptyMessage) {
+  const section = document.createElement("section");
+  section.className = "gate-flow-section";
+
+  const heading = document.createElement("div");
+  heading.className = "gate-flow-header";
+  heading.innerHTML = `<h4>${title}</h4><span>${flights.length}</span>`;
+  section.appendChild(heading);
+
+  if (!flights.length) {
+    const empty = document.createElement("div");
+    empty.className = "gate-flow-empty";
+    empty.textContent = emptyMessage;
+    section.appendChild(empty);
+    return section;
+  }
+
+  const list = document.createElement("div");
+  list.className = "flight-list";
+  flights.forEach((flight) => list.appendChild(buildFlightRow(flight)));
+  section.appendChild(list);
+  return section;
+}
+
+
+function renderTurnSummary(gate) {
+  const summary = document.createElement("div");
+  summary.className = "turn-summary";
+
+  if (!gate.turnWindows.length) {
+    summary.innerHTML = `
+      <div class="turn-pill">
+        <span class="turn-label">Turn windows</span>
+        <strong>Need both an arrival and later departure</strong>
+      </div>
+    `;
+    return summary;
+  }
+
+  summary.innerHTML = `
+    <div class="turn-pill">
+      <span class="turn-label">Shortest turn</span>
+      <strong>${formatMinutes(gate.quickestTurnMinutes)}</strong>
+    </div>
+    <div class="turn-pill">
+      <span class="turn-label">Longest gap</span>
+      <strong>${formatMinutes(gate.longestTurnMinutes)}</strong>
+    </div>
+  `;
+
+  return summary;
 }
 
 
@@ -279,6 +426,9 @@ function renderTerminals(terminals) {
         if (gate.earlyFlights > 0) {
           gateCard.classList.add("is-early");
         }
+        if (gate.quickestTurnMinutes != null && gate.quickestTurnMinutes <= 60) {
+          gateCard.classList.add("has-quick-turn");
+        }
 
         const header = document.createElement("div");
         header.className = "gate-card-header";
@@ -286,7 +436,8 @@ function renderTerminals(terminals) {
           <div>
             <h3 class="gate-id">${gate.gate}</h3>
             <div class="gate-meta">
-              <span class="gate-count">${gate.totalFlights} flight${gate.totalFlights === 1 ? "" : "s"}</span>
+              <span class="gate-count">${gate.arrivalCount} arrival${gate.arrivalCount === 1 ? "" : "s"}</span>
+              <span class="gate-count">${gate.departureCount} departure${gate.departureCount === 1 ? "" : "s"}</span>
               <span class="gate-count ${gate.earlyFlights ? "is-early" : ""}">
                 ${gate.earlyFlights} early
               </span>
@@ -294,11 +445,14 @@ function renderTerminals(terminals) {
           </div>
         `;
 
-        const list = document.createElement("div");
-        list.className = "flight-list";
-        gate.flights.forEach((flight) => list.appendChild(buildFlightRow(flight)));
+        const flowGrid = document.createElement("div");
+        flowGrid.className = "gate-flow-grid";
+        flowGrid.append(
+          buildFlightSection("Arrivals", gate.arrivals, "No arrivals match the current filter."),
+          buildFlightSection("Departures", gate.departures, "No departures match the current filter."),
+        );
 
-        gateCard.append(header, list);
+        gateCard.append(header, renderTurnSummary(gate), flowGrid);
         return gateCard;
       });
 
@@ -310,11 +464,11 @@ function renderTerminals(terminals) {
       <div class="terminal-header">
         <div>
           <h2 class="terminal-title">Terminal ${terminal.terminal}</h2>
-          <p class="terminal-subtitle">Gate-level arrivals for the current DFW day board.</p>
+          <p class="terminal-subtitle">Gate-level arrivals, departures, and likely turn windows for today's DFW board.</p>
         </div>
         <div class="terminal-stats">
-          <span class="terminal-chip">${terminal.totalFlights} arrivals</span>
-          <span class="terminal-chip">${terminal.earlyFlights} early</span>
+          <span class="terminal-chip">${terminal.arrivalCount} arrivals</span>
+          <span class="terminal-chip">${terminal.departureCount} departures</span>
           <span class="terminal-chip">${terminal.gateCount} gates</span>
         </div>
       </div>
@@ -373,7 +527,7 @@ async function loadData(forceRefresh = false) {
     render();
   } catch (error) {
     statusBanner.hidden = false;
-    statusBanner.textContent = `Unable to load live arrivals: ${error.message}`;
+    statusBanner.textContent = `Unable to load live flight activity: ${error.message}`;
   } finally {
     refreshButton.disabled = false;
     refreshButton.textContent = "Refresh live data";

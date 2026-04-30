@@ -27,11 +27,14 @@ ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 TIMEZONE_NAME = "America/Chicago"
 SOURCE_BASE = "https://www.airport-dallas.com"
-BOARD_URL = f"{SOURCE_BASE}/dfw-arrivals"
+ARRIVALS_BOARD_URL = f"{SOURCE_BASE}/dfw-arrivals"
+DEPARTURES_BOARD_URL = f"{SOURCE_BASE}/dfw-departures"
 TIME_PERIODS = (0, 6, 12, 18)
 CACHE_TTL_SECONDS = 300
 MAX_BOARD_WORKERS = 4
 MAX_DETAIL_WORKERS = 16
+QUICK_TURN_MAX_MINUTES = 60
+LONG_TURN_MIN_MINUTES = 180
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,6 +55,10 @@ FIELD_BLOCK_RE = re.compile(
 )
 SCHEDULED_ARRIVAL_RE = re.compile(
     r"Scheduled Arrival Time:\s*(?P<value>[^<]+)<",
+    re.IGNORECASE | re.DOTALL,
+)
+SCHEDULED_DEPARTURE_RE = re.compile(
+    r"Scheduled Departure Time:\s*(?P<value>[^<]+)<",
     re.IGNORECASE | re.DOTALL,
 )
 TAG_RE = re.compile(r"<[^>]+>")
@@ -113,8 +120,10 @@ def parse_primary_airline(block: str) -> str:
     return values[0] if values else "Unknown"
 
 
-def parse_board_page(time_period: int) -> list[dict]:
-    html = fetch_html(f"{BOARD_URL}?tp={time_period}")
+def parse_board_page(direction: str, time_period: int) -> list[dict]:
+    board_url = ARRIVALS_BOARD_URL if direction == "arrival" else DEPARTURES_BOARD_URL
+    detail_param = "arrival" if direction == "arrival" else "departure"
+    html = fetch_html(f"{board_url}?tp={time_period}")
     flights = []
 
     start = html.find('<div class="flights-info">')
@@ -137,7 +146,7 @@ def parse_board_page(time_period: int) -> list[dict]:
             re.DOTALL,
         )
         detail_match = re.search(
-            r'href="(?P<detail>/dfw-flight-status\?arrival=(?P<flight>[^"]+))"',
+            rf'href="(?P<detail>/dfw-flight-status\?{detail_param}=(?P<flight>[^"]+))"',
             row,
             re.DOTALL,
         )
@@ -179,38 +188,61 @@ def parse_board_page(time_period: int) -> list[dict]:
 
         flights.append(
             {
+                "direction": direction,
+                "directionLabel": "Arrival" if direction == "arrival" else "Departure",
                 "flightNumber": flight_number,
                 "codeshares": codeshares,
                 "airline": airline,
-                "origin": origin,
-                "originCode": origin_code,
+                "city": origin,
+                "cityCode": origin_code,
                 "terminal": terminal,
-                "scheduledArrival": scheduled_arrival,
+                "scheduledTime": scheduled_arrival,
                 "status": status,
                 "detailPath": detail_path,
                 "detailUrl": urljoin(SOURCE_BASE, detail_path),
                 "boardPeriodStartHour": time_period,
+                "gate": None,
+                "gateLabel": "TBD",
             }
         )
 
     return flights
 
 
-def extract_arrival_segment(html: str) -> str:
-    anchor = html.find("Estimated Arrival Time:")
-    if anchor == -1:
-        anchor = html.find("Scheduled Arrival Time:")
+def extract_detail_segment(html: str, direction: str) -> str:
+    if direction == "arrival":
+        anchors = ("Estimated Arrival Time:", "Arrived at:", "Scheduled Arrival Time:")
+        before = 800
+        after = 2200
+    else:
+        anchors = ("Estimated Departure Time:", "Departed at:", "Scheduled Departure Time:")
+        before = 1200
+        after = 1600
+
+    anchor = -1
+    for candidate in anchors:
+        anchor = html.find(candidate)
+        if anchor != -1:
+            break
     if anchor == -1:
         return html
 
-    start = max(0, anchor - 600)
-    end = min(len(html), anchor + 2000)
+    start = max(0, anchor - before)
+    end = min(len(html), anchor + after)
     return html[start:end]
 
 
-def parse_detail_page(detail_url: str) -> dict:
+def pick_first_field(fields: dict[str, str], *names: str) -> str | None:
+    for name in names:
+        value = normalize_field(fields.get(name))
+        if value:
+            return value
+    return None
+
+
+def parse_detail_page(detail_url: str, direction: str) -> dict:
     html = fetch_html(detail_url)
-    segment = extract_arrival_segment(html)
+    segment = extract_detail_segment(html, direction)
 
     fields = {}
     for match in FIELD_BLOCK_RE.finditer(segment):
@@ -219,14 +251,19 @@ def parse_detail_page(detail_url: str) -> dict:
         if label and value:
             fields[label] = value
 
-    scheduled_match = SCHEDULED_ARRIVAL_RE.search(segment)
+    scheduled_regex = SCHEDULED_ARRIVAL_RE if direction == "arrival" else SCHEDULED_DEPARTURE_RE
+    scheduled_match = scheduled_regex.search(segment)
     scheduled_arrival = clean_text(scheduled_match.group("value")) if scheduled_match else ""
+    if direction == "arrival":
+        event_time = pick_first_field(fields, "estimated arrival time", "arrived at")
+    else:
+        event_time = pick_first_field(fields, "estimated departure time", "departed at")
 
     return {
-        "estimatedArrival": fields.get("estimated arrival time"),
+        "eventTime": event_time,
         "terminal": normalize_field(fields.get("terminal")),
         "gate": normalize_field(fields.get("gate")),
-        "scheduledArrival": scheduled_arrival,
+        "scheduledTime": scheduled_arrival,
     }
 
 
@@ -259,31 +296,28 @@ def parse_clock_time(value: str) -> datetime | None:
 
 def enrich_flight(flight: dict) -> dict:
     try:
-        detail = parse_detail_page(flight["detailUrl"])
+        detail = parse_detail_page(flight["detailUrl"], flight["direction"])
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
         flight["detailError"] = str(exc)
         detail = {}
 
     if detail.get("terminal"):
         flight["terminal"] = detail["terminal"]
-    if detail.get("scheduledArrival"):
-        flight["scheduledArrival"] = detail["scheduledArrival"]
-    if detail.get("estimatedArrival"):
-        flight["estimatedArrival"] = detail["estimatedArrival"]
-    else:
-        flight["estimatedArrival"] = None
+    if detail.get("scheduledTime"):
+        flight["scheduledTime"] = detail["scheduledTime"]
+    flight["eventTime"] = detail.get("eventTime") or None
     flight["terminal"] = normalize_field(flight.get("terminal"))
     flight["gate"] = detail.get("gate") or None
 
-    scheduled_dt = parse_clock_time(flight.get("scheduledArrival", ""))
-    estimated_dt = parse_clock_time(flight.get("estimatedArrival", ""))
+    scheduled_dt = parse_clock_time(flight.get("scheduledTime", ""))
+    event_dt = parse_clock_time(flight.get("eventTime", ""))
 
-    flight["scheduledArrivalIso"] = scheduled_dt.isoformat() if scheduled_dt else None
-    flight["estimatedArrivalIso"] = estimated_dt.isoformat() if estimated_dt else None
+    flight["scheduledTimeIso"] = scheduled_dt.isoformat() if scheduled_dt else None
+    flight["eventTimeIso"] = event_dt.isoformat() if event_dt else None
 
     delta_minutes = None
-    if scheduled_dt and estimated_dt:
-        delta_minutes = int((estimated_dt - scheduled_dt).total_seconds() // 60)
+    if flight["direction"] == "arrival" and scheduled_dt and event_dt:
+        delta_minutes = int((event_dt - scheduled_dt).total_seconds() // 60)
 
     status_text = flight.get("status", "").lower()
     is_early = False
@@ -299,6 +333,18 @@ def enrich_flight(flight: dict) -> dict:
     flight["isEarly"] = is_early
     flight["minutesEarly"] = minutes_early
     flight["gateLabel"] = flight["gate"] or "TBD"
+    flight["turnReferenceTimeIso"] = flight["eventTimeIso"] or flight["scheduledTimeIso"]
+    flight["turnReferenceTime"] = flight["eventTime"] or flight["scheduledTime"]
+    if flight["direction"] == "arrival":
+        flight["origin"] = flight["city"]
+        flight["originCode"] = flight["cityCode"]
+        flight["scheduledArrival"] = flight["scheduledTime"]
+        flight["estimatedArrival"] = flight["eventTime"]
+    else:
+        flight["destination"] = flight["city"]
+        flight["destinationCode"] = flight["cityCode"]
+        flight["scheduledDeparture"] = flight["scheduledTime"]
+        flight["estimatedDeparture"] = flight["eventTime"]
     return flight
 
 
@@ -306,10 +352,66 @@ def sort_flights(flights: list[dict]) -> list[dict]:
     def sort_key(flight: dict) -> tuple:
         terminal = flight.get("terminal") or "Z"
         gate = flight.get("gate") or "ZZZ"
-        scheduled = flight.get("scheduledArrivalIso") or "9999"
+        scheduled = flight.get("scheduledTimeIso") or "9999"
         return terminal, gate, scheduled, flight.get("flightNumber") or ""
 
     return sorted(flights, key=sort_key)
+
+
+def classify_turn_window(minutes: int) -> str:
+    if minutes <= QUICK_TURN_MAX_MINUTES:
+        return "quick"
+    if minutes >= LONG_TURN_MIN_MINUTES:
+        return "long"
+    return "standard"
+
+
+def build_turn_windows(arrivals: list[dict], departures: list[dict]) -> list[dict]:
+    sorted_arrivals = sorted(
+        [flight for flight in arrivals if flight.get("turnReferenceTimeIso")],
+        key=lambda flight: flight["turnReferenceTimeIso"],
+    )
+    sorted_departures = sorted(
+        [flight for flight in departures if flight.get("turnReferenceTimeIso")],
+        key=lambda flight: flight["turnReferenceTimeIso"],
+    )
+
+    windows = []
+    departure_index = 0
+
+    for arrival in sorted_arrivals:
+        arrival_dt = parse_clock_time(arrival.get("turnReferenceTime") or "")
+        if arrival_dt is None:
+            continue
+
+        while departure_index < len(sorted_departures):
+            departure = sorted_departures[departure_index]
+            departure_dt = parse_clock_time(departure.get("turnReferenceTime") or "")
+            if departure_dt is None:
+                departure_index += 1
+                continue
+            if departure_dt <= arrival_dt:
+                departure_index += 1
+                continue
+
+            minutes = int((departure_dt - arrival_dt).total_seconds() // 60)
+            windows.append(
+                {
+                    "arrivalFlightNumber": arrival["flightNumber"],
+                    "departureFlightNumber": departure["flightNumber"],
+                    "arrivalAirline": arrival.get("airline"),
+                    "departureAirline": departure.get("airline"),
+                    "arrivalTime": arrival.get("turnReferenceTime"),
+                    "departureTime": departure.get("turnReferenceTime"),
+                    "minutesBetween": minutes,
+                    "category": classify_turn_window(minutes),
+                    "sameAirline": arrival.get("airline") == departure.get("airline"),
+                }
+            )
+            departure_index += 1
+            break
+
+    return windows
 
 
 def build_terminal_groups(flights: list[dict]) -> list[dict]:
@@ -325,6 +427,8 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
                 "terminal": terminal_name,
                 "totalFlights": 0,
                 "earlyFlights": 0,
+                "arrivalCount": 0,
+                "departureCount": 0,
                 "gateCount": 0,
                 "gates": {},
             },
@@ -332,6 +436,10 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
         terminal["totalFlights"] += 1
         if flight.get("isEarly"):
             terminal["earlyFlights"] += 1
+        if flight.get("direction") == "arrival":
+            terminal["arrivalCount"] += 1
+        else:
+            terminal["departureCount"] += 1
 
         gate = terminal["gates"].setdefault(
             gate_name,
@@ -339,13 +447,24 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
                 "gate": gate_name,
                 "totalFlights": 0,
                 "earlyFlights": 0,
-                "flights": [],
+                "arrivalCount": 0,
+                "departureCount": 0,
+                "arrivals": [],
+                "departures": [],
+                "turnWindows": [],
+                "quickestTurnMinutes": None,
+                "longestTurnMinutes": None,
             },
         )
         gate["totalFlights"] += 1
         if flight.get("isEarly"):
             gate["earlyFlights"] += 1
-        gate["flights"].append(flight)
+        if flight.get("direction") == "arrival":
+            gate["arrivalCount"] += 1
+            gate["arrivals"].append(flight)
+        else:
+            gate["departureCount"] += 1
+            gate["departures"].append(flight)
 
     payload = []
     sorted_terminal_names = sorted(
@@ -358,11 +477,19 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
         gate_rows = []
         for gate_name in sorted(terminal["gates"]):
             gate = terminal["gates"][gate_name]
-            gate["flights"] = sort_flights(gate["flights"])
+            gate["arrivals"] = sort_flights(gate["arrivals"])
+            gate["departures"] = sort_flights(gate["departures"])
+            gate["turnWindows"] = build_turn_windows(gate["arrivals"], gate["departures"])
+            if gate["turnWindows"]:
+                minutes = [window["minutesBetween"] for window in gate["turnWindows"]]
+                gate["quickestTurnMinutes"] = min(minutes)
+                gate["longestTurnMinutes"] = max(minutes)
             gate_rows.append(gate)
 
         gate_rows.sort(
             key=lambda gate: (
+                gate["quickestTurnMinutes"] is None,
+                gate["quickestTurnMinutes"] if gate["quickestTurnMinutes"] is not None else 999999,
                 -gate["earlyFlights"],
                 gate["gate"] == "TBD",
                 gate["gate"],
@@ -376,9 +503,17 @@ def build_terminal_groups(flights: list[dict]) -> list[dict]:
 
 
 def summarize(terminals: list[dict], flights: list[dict]) -> dict:
+    arrivals = [flight for flight in flights if flight.get("direction") == "arrival"]
+    departures = [flight for flight in flights if flight.get("direction") == "departure"]
     total_flights = len(flights)
-    early_flights = sum(1 for flight in flights if flight.get("isEarly"))
+    early_flights = sum(1 for flight in arrivals if flight.get("isEarly"))
     total_gates = sum(terminal["gateCount"] for terminal in terminals)
+    turn_windows = [
+        window
+        for terminal in terminals
+        for gate in terminal["gates"]
+        for window in gate["turnWindows"]
+    ]
     busiest_terminal = max(
         terminals,
         key=lambda terminal: terminal["totalFlights"],
@@ -387,32 +522,38 @@ def summarize(terminals: list[dict], flights: list[dict]) -> dict:
 
     return {
         "totalFlights": total_flights,
+        "totalArrivals": len(arrivals),
+        "totalDepartures": len(departures),
         "earlyFlights": early_flights,
         "trackedGates": total_gates,
         "terminalCount": len(terminals),
+        "quickTurnWindows": sum(1 for window in turn_windows if window["category"] == "quick"),
+        "longTurnWindows": sum(1 for window in turn_windows if window["category"] == "long"),
         "busiestTerminal": busiest_terminal["terminal"] if busiest_terminal else None,
         "busiestTerminalFlights": busiest_terminal["totalFlights"] if busiest_terminal else 0,
     }
 
 
-def scrape_arrivals() -> dict:
+def scrape_gate_activity() -> dict:
     board_flights = {}
     errors = []
 
     with ThreadPoolExecutor(max_workers=MAX_BOARD_WORKERS) as pool:
         future_map = {
-            pool.submit(parse_board_page, time_period): time_period for time_period in TIME_PERIODS
+            pool.submit(parse_board_page, direction, time_period): (direction, time_period)
+            for direction in ("arrival", "departure")
+            for time_period in TIME_PERIODS
         }
         for future in as_completed(future_map):
-            time_period = future_map[future]
+            direction, time_period = future_map[future]
             try:
                 flights = future.result()
             except Exception as exc:  # pragma: no cover
-                errors.append(f"Board tp={time_period}: {exc}")
+                errors.append(f"{direction.title()} board tp={time_period}: {exc}")
                 continue
 
             for flight in flights:
-                board_flights[flight["flightNumber"]] = flight
+                board_flights[(direction, flight["flightNumber"])] = flight
 
     flights = list(board_flights.values())
 
@@ -443,7 +584,8 @@ def scrape_arrivals() -> dict:
         "flights": flights,
         "source": {
             "name": "airport-dallas.com",
-            "boardUrl": BOARD_URL,
+            "arrivalsBoardUrl": ARRIVALS_BOARD_URL,
+            "departuresBoardUrl": DEPARTURES_BOARD_URL,
             "detailBaseUrl": f"{SOURCE_BASE}/dfw-flight-status",
         },
         "errors": errors,
@@ -458,7 +600,7 @@ def get_arrivals(force_refresh: bool = False) -> dict:
         if cached and is_fresh and not force_refresh:
             return cached
 
-    payload = scrape_arrivals()
+    payload = scrape_gate_activity()
 
     with _cache_lock:
         _cache["payload"] = payload
